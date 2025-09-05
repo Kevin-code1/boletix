@@ -5,3 +5,5 @@ pydantic
 pytest
 httpx
 python-multipart
+python-dotenv
+qrcode[pil]

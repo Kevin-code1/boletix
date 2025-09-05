@@ -17,7 +17,7 @@ def test_login_and_purchase():
     # Login
     response = client.post(
         "/api/login",
-        data={"username": "demo", "password": "demo"},
+        json={"email": "demo@example.com", "password": "demo"},
     )
     assert response.status_code == 200
     data = response.json()
@@ -26,3 +26,8 @@ def test_login_and_purchase():
     purchase = client.post("/api/events/1/seats/1/purchase")
     # puede devolver 409 si otro test ya lo vendió
     assert purchase.status_code in (200, 409)
+    if purchase.status_code == 200:
+        order_id = purchase.json()["order_id"]
+        qr = client.get(f"/tickets/{order_id}/qrcode.png")
+        assert qr.status_code == 200
+        assert qr.headers["content-type"] == "image/png"

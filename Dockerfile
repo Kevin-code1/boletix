@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r backend/requirements.txt
 # Copiar código de backend y frontend
 COPY backend /app/backend
 COPY frontend /app/frontend
+COPY .env /app/.env
 
 # Exponer puerto de la aplicación
 EXPOSE 8000

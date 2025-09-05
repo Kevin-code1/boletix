@@ -1,13 +1,20 @@
-from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi import FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect, Request
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 from jose import jwt
 from pydantic import BaseModel
-from typing import Dict, List
+from typing import Dict, List, Tuple
 import os
 from datetime import datetime, timedelta
+import asyncio
+from itertools import count
+from io import BytesIO
+import qrcode
+from dotenv import load_dotenv
 
-# Cargar la clave secreta desde variables de entorno (usada para firmar JWT). Si no existe, usar un valor por defecto.
+# Cargar variables de entorno desde .env para ejecución local
+load_dotenv()
+# Clave secreta usada para firmar JWT
 SECRET_KEY: str = os.getenv("JWT_SECRET", "changeme")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
@@ -26,6 +33,17 @@ class Seat(BaseModel):
     sold: bool = False
 
 
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class Order(BaseModel):
+    id: int
+    event_id: int
+    seat_id: int
+
+
 # Datos en memoria para eventos y asientos. Cada evento tiene un listado de asientos.
 events_data: Dict[int, Dict[str, List[Seat] or Event]] = {
     1: {
@@ -41,6 +59,16 @@ events_data: Dict[int, Dict[str, List[Seat] or Event]] = {
 # Diccionario para mantener conexiones WebSocket por evento
 connections: Dict[int, List[WebSocket]] = {}
 
+# Locks para control de concurrencia por asiento
+locks: Dict[Tuple[int, int], asyncio.Lock] = {}
+
+# Almacén simple de órdenes
+orders: Dict[int, Order] = {}
+order_counter = count(1)
+
+# Intentos de login por IP para rate limiting
+login_attempts: Dict[str, List[datetime]] = {}
+
 
 def create_access_token(data: dict, expires_delta: timedelta) -> str:
     """Genera un token JWT con expiración."""
@@ -52,21 +80,26 @@ def create_access_token(data: dict, expires_delta: timedelta) -> str:
 
 
 @app.post("/api/login")
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+async def login(payload: LoginRequest, request: Request):
     """
-    Endpoint de login. Acepta usuario y contraseña y devuelve un token JWT.
-    Actualmente sólo existe un usuario demo (demo/demo).
+    Login JSON simple (email/password). Usuario demo: demo@example.com / demo
+    con limitación de 5 intentos por minuto por IP.
     """
-    username = form_data.username
-    password = form_data.password
-    # usuario demo
-    if username != "demo" or password != "demo":
+    ip = request.client.host if request.client else "unknown"
+    now = datetime.utcnow()
+    attempts = [t for t in login_attempts.get(ip, []) if now - t < timedelta(minutes=1)]
+    if len(attempts) >= 5:
+        raise HTTPException(status_code=429, detail="Demasiados intentos, intente luego")
+    attempts.append(now)
+    login_attempts[ip] = attempts
+
+    if payload.email != "demo@example.com" or payload.password != "demo":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Credenciales inválidas",
         )
     access_token = create_access_token(
-        data={"sub": username},
+        data={"sub": payload.email},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
     return {"access_token": access_token, "token_type": "bearer"}
@@ -88,24 +121,45 @@ async def get_seats(event_id: int):
 
 @app.post("/api/events/{event_id}/seats/{seat_id}/purchase")
 async def purchase_seat(event_id: int, seat_id: int):
-    """
-    Permite comprar un asiento.  Si el asiento ya se vendió devuelve 409.
-    Si la compra tiene éxito notifica a los WebSockets conectados.
-    """
+    """Compra de asiento con control de concurrencia y creación de orden."""
     event = events_data.get(event_id)
     if not event:
         raise HTTPException(status_code=404, detail="Evento no encontrado")
-    # buscar asiento
-    for seat in event["seats"]:
-        if seat.id == seat_id:
-            if seat.sold:
-                raise HTTPException(status_code=409, detail="Asiento ya vendido")
-            seat.sold = True
-            # Notificar a los clientes conectados por WebSocket
-            for ws in connections.get(event_id, []):
-                await ws.send_json({"seat_id": seat_id, "sold": True})
-            return {"message": "Compra exitosa"}
+
+    lock = locks.setdefault((event_id, seat_id), asyncio.Lock())
+    async with lock:
+        for seat in event["seats"]:
+            if seat.id == seat_id:
+                if seat.sold:
+                    raise HTTPException(status_code=409, detail="Asiento ya vendido")
+                seat.sold = True
+                order_id = next(order_counter)
+                order = Order(id=order_id, event_id=event_id, seat_id=seat_id)
+                orders[order_id] = order
+                for ws in connections.get(event_id, []):
+                    await ws.send_json({"seat_id": seat_id, "sold": True})
+                return {"message": "Compra exitosa", "order_id": order_id}
     raise HTTPException(status_code=404, detail="Asiento no encontrado")
+
+
+@app.get("/api/orders", response_model=List[Order])
+async def get_orders():
+    """Listado simple de órdenes generadas."""
+    return list(orders.values())
+
+
+@app.get("/tickets/{order_id}/qrcode.png")
+async def ticket_qr(order_id: int):
+    """Devuelve un PNG con el QR que contiene datos de la orden firmados."""
+    order = orders.get(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Orden no encontrada")
+    token = jwt.encode(order.dict(), SECRET_KEY, algorithm=ALGORITHM)
+    img = qrcode.make(token)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png")
 
 
 @app.websocket("/ws/{event_id}")

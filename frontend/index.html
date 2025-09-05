@@ -19,7 +19,7 @@
     <h1>Boletix</h1>
     <p>Proyecto demo de venta de boletos.</p>
     <div id="login">
-        <input id="username" placeholder="Usuario" value="demo">
+        <input id="email" placeholder="Email" type="email" value="demo@example.com">
         <input id="password" placeholder="Contraseña" type="password" value="demo">
         <button onclick="login()">Login</button>
     </div>
@@ -27,17 +27,15 @@
     <div id="events"></div>
 
     <script>
+        let ws;
         async function login() {
-            const username = document.getElementById('username').value;
+            const email = document.getElementById('email').value;
             const password = document.getElementById('password').value;
-            const formData = new URLSearchParams();
-            formData.append('username', username);
-            formData.append('password', password);
-            formData.append('grant_type', '');
-            formData.append('scope', '');
-            formData.append('client_id', '');
-            formData.append('client_secret', '');
-            const res = await fetch('/api/login', { method:'POST', body: formData });
+            const res = await fetch('/api/login', {
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({email, password})
+            });
             const data = await res.json();
             if (data.access_token) {
                 localStorage.setItem('token', data.access_token);
@@ -66,18 +64,36 @@
             container.innerHTML = '<h2>Asientos</h2>';
             seats.forEach(s => {
                 const btn = document.createElement('button');
+                btn.dataset.id = s.id;
                 btn.textContent = `${s.number}${s.sold ? ' (vendido)' : ''}`;
                 btn.disabled = s.sold;
                 btn.onclick = () => purchase(id, s.id);
                 container.appendChild(btn);
             });
+            if (ws) ws.close();
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            ws = new WebSocket(`${proto}://${location.host}/ws/${id}`);
+            ws.onmessage = evt => {
+                const data = JSON.parse(evt.data);
+                const btn = [...container.querySelectorAll('button')].find(b => b.dataset.id == data.seat_id);
+                if (btn) {
+                    btn.textContent = `${btn.textContent.split(' ')[0]} (vendido)`;
+                    btn.disabled = true;
+                }
+            };
         }
         async function purchase(eventId, seatId) {
-            const res = await fetch(`/api/events/${eventId}/seats/${seatId}/purchase`, { method:'POST' });
+            const token = localStorage.getItem('token');
+            const res = await fetch(`/api/events/${eventId}/seats/${seatId}/purchase`, {
+                method:'POST',
+                headers: token ? {'Authorization': 'Bearer '+token} : {}
+            });
             if (res.status === 409) {
                 alert('Asiento ya vendido');
+            } else {
+                const data = await res.json();
+                alert('Orden #' + data.order_id);
             }
-            loadSeats(eventId);
         }
         // Cargar eventos al iniciar
         loadEvents();
