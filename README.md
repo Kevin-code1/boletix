@@ -6,14 +6,14 @@ Boletix es un sistema de boletaje simplificado construido con **FastAPI** para e
 
 - **API REST** para listar eventos, consultar asientos y comprar boletos.
 - **Autenticación JWT** con un usuario demo (`demo/demo`).
-- **Actualización en tiempo real** de los asientos mediante WebSockets (`/ws/{event_id}`).
+- **Actualización en tiempo real** de los asientos mediante WebSockets (`/ws/events/{event_id}`).
 - **Dockerfile** y **docker‑compose** para levantar la aplicación con un solo comando.
 - **Pruebas unitarias** con `pytest` utilizando `fastapi.testclient`.
 - **Workflows de GitHub Actions** para CI y publicación automática de la imagen a GHCR.
 
-## Uso
+## Cómo ejecutar
 
-### Levantar en local con Docker
+### Docker
 
 1. Clona este repositorio y ubícate en la raíz del proyecto.
 2. Crea un archivo `.env` con la variable `JWT_SECRET` para firmar tokens JWT:
@@ -28,7 +28,14 @@ Boletix es un sistema de boletaje simplificado construido con **FastAPI** para e
    docker compose up -d
    ```
 
-4. Accede a la aplicación en [http://localhost:8000](http://localhost:8000).  El frontend estático sirve una página mínima que consume la API. También puedes probar la API directamente.
+4. Accede a la aplicación en [http://localhost:8000](http://localhost:8000).  El frontend estático sirve una página mínima que consume la API.
+
+### Local
+
+```bash
+pip install -r backend/requirements.txt
+uvicorn backend.app.main:app --reload
+```
 
 ### Endpoints principales
 
@@ -36,9 +43,15 @@ Boletix es un sistema de boletaje simplificado construido con **FastAPI** para e
 |-------:|------------------------------------|-----------------------------------------|
 | GET    | `/api/events`                      | Lista de eventos disponibles            |
 | GET    | `/api/events/{event_id}/seats`     | Lista de asientos de un evento          |
-| POST   | `/api/login`                       | Login con `username` y `password`       |
-| POST   | `/api/events/{event_id}/seats/{seat_id}/purchase` | Compra un asiento (puede devolver 409 si está vendido) |
-| WS     | `/ws/{event_id}`                   | Conexión WebSocket para actualizaciones |
+| POST   | `/api/login`                       | Login con `email` y `password`          |
+| POST   | `/api/orders`                      | Crear orden `{event_id, seat_ids}`      |
+| WS     | `/ws/events/{event_id}`            | Conexión WebSocket para actualizaciones |
+
+## Pruebas manuales
+
+1. Abrir dos pestañas en el mismo evento. Comprar un asiento en una y verificar que en la otra se deshabilita en tiempo real.
+2. Intentar comprar dos veces el mismo asiento; la segunda petición devuelve **409** y se refresca el estado.
+3. Tras una compra exitosa, visitar `/tickets/{orderId}/qrcode.png` para ver el código QR del ticket.
 
 ### Pruebas de carga
 

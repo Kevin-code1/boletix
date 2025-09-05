@@ -1,7 +1,16 @@
-from fastapi import FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect, Request
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    status,
+    WebSocket,
+    WebSocketDisconnect,
+    Request,
+    Depends,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse
-from jose import jwt
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt, JWTError
 from pydantic import BaseModel
 from typing import Dict, List, Tuple
 import os
@@ -41,7 +50,12 @@ class LoginRequest(BaseModel):
 class Order(BaseModel):
     id: int
     event_id: int
-    seat_id: int
+    seat_ids: List[int]
+
+
+class OrderCreate(BaseModel):
+    event_id: int
+    seat_ids: List[int]
 
 
 # Datos en memoria para eventos y asientos. Cada evento tiene un listado de asientos.
@@ -65,6 +79,9 @@ locks: Dict[Tuple[int, int], asyncio.Lock] = {}
 # Almacén simple de órdenes
 orders: Dict[int, Order] = {}
 order_counter = count(1)
+
+# Esquema de seguridad HTTP Bearer para validar JWT
+security = HTTPBearer()
 
 # Intentos de login por IP para rate limiting
 login_attempts: Dict[str, List[datetime]] = {}
@@ -119,27 +136,50 @@ async def get_seats(event_id: int):
     return events_data[event_id]["seats"]
 
 
-@app.post("/api/events/{event_id}/seats/{seat_id}/purchase")
-async def purchase_seat(event_id: int, seat_id: int):
-    """Compra de asiento con control de concurrencia y creación de orden."""
-    event = events_data.get(event_id)
+@app.post("/api/orders")
+async def create_order(
+    payload: OrderCreate,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """Crea una orden comprando los asientos indicados con control de concurrencia."""
+    try:
+        jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
+    event = events_data.get(payload.event_id)
     if not event:
         raise HTTPException(status_code=404, detail="Evento no encontrado")
 
-    lock = locks.setdefault((event_id, seat_id), asyncio.Lock())
-    async with lock:
-        for seat in event["seats"]:
-            if seat.id == seat_id:
-                if seat.sold:
-                    raise HTTPException(status_code=409, detail="Asiento ya vendido")
-                seat.sold = True
-                order_id = next(order_counter)
-                order = Order(id=order_id, event_id=event_id, seat_id=seat_id)
-                orders[order_id] = order
-                for ws in connections.get(event_id, []):
-                    await ws.send_json({"seat_id": seat_id, "sold": True})
-                return {"message": "Compra exitosa", "order_id": order_id}
-    raise HTTPException(status_code=404, detail="Asiento no encontrado")
+    seat_ids = sorted(payload.seat_ids)
+    locks_to_acquire = [
+        locks.setdefault((payload.event_id, sid), asyncio.Lock()) for sid in seat_ids
+    ]
+    for lock in locks_to_acquire:
+        await lock.acquire()
+    try:
+        seats = event["seats"]
+        selected: List[Seat] = []
+        for sid in seat_ids:
+            seat = next((s for s in seats if s.id == sid), None)
+            if not seat:
+                raise HTTPException(status_code=404, detail="Asiento no encontrado")
+            if seat.sold:
+                raise HTTPException(status_code=409, detail="Asiento ya vendido")
+            selected.append(seat)
+        for seat in selected:
+            seat.sold = True
+        order_id = next(order_counter)
+        orders[order_id] = Order(
+            id=order_id, event_id=payload.event_id, seat_ids=seat_ids
+        )
+    finally:
+        for lock in locks_to_acquire:
+            lock.release()
+
+    for ws in connections.get(payload.event_id, []):
+        await ws.send_json({"type": "seats_updated", "seat_ids": seat_ids})
+    return {"order_id": order_id}
 
 
 @app.get("/api/orders", response_model=List[Order])
@@ -162,7 +202,7 @@ async def ticket_qr(order_id: int):
     return StreamingResponse(buf, media_type="image/png")
 
 
-@app.websocket("/ws/{event_id}")
+@app.websocket("/ws/events/{event_id}")
 async def websocket_endpoint(websocket: WebSocket, event_id: int):
     """
     Conexión WebSocket para recibir actualizaciones en tiempo real de los asientos.

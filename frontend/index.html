@@ -5,14 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Boletix</title>
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 2rem;
-        }
-        #events button {
-            margin: 0.2rem;
-            padding: 0.5rem 1rem;
-        }
+        body { font-family: Arial, sans-serif; margin: 2rem; }
+        #seats button { margin: 0.2rem; padding: 0.5rem 1rem; }
+        button.sel { background: orange; }
+        button.sold { background: #ccc; }
+        #status { margin-top: 1rem; }
     </style>
 </head>
 <body>
@@ -25,25 +22,30 @@
     </div>
     <hr>
     <div id="events"></div>
+    <div id="status"></div>
+    <img id="qr" style="display:none;margin-top:1rem"/>
 
     <script>
-        let ws;
+        let ws, pingInterval, retry = 0, currentEventId;
+
         async function login() {
             const email = document.getElementById('email').value;
             const password = document.getElementById('password').value;
             const res = await fetch('/api/login', {
-                method:'POST',
-                headers:{'Content-Type':'application/json'},
-                body: JSON.stringify({email, password})
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, password })
             });
             const data = await res.json();
             if (data.access_token) {
                 localStorage.setItem('token', data.access_token);
+                document.getElementById('login').style.display = 'none';
                 loadEvents();
             } else {
-                alert('Credenciales incorrectas');
+                document.getElementById('status').textContent = 'Credenciales incorrectas';
             }
         }
+
         async function loadEvents() {
             const res = await fetch('/api/events');
             const events = await res.json();
@@ -57,45 +59,114 @@
                 container.appendChild(div);
             });
         }
+
+        function updateBuyButton() {
+            const buy = document.getElementById('buy');
+            const anySel = document.querySelectorAll('#seats button.sel').length > 0;
+            if (buy) buy.disabled = !anySel;
+        }
+
+        function toggleSeat(btn) {
+            if (btn.classList.contains('sold')) return;
+            btn.classList.toggle('sel');
+            btn.classList.toggle('free');
+            updateBuyButton();
+        }
+
+        function updateSeatButton(id) {
+            const btn = document.querySelector(`#seats button[data-id="${id}"]`);
+            if (!btn) return;
+            btn.textContent = `${btn.textContent.split(' ')[0]} (vendido)`;
+            btn.className = 'sold';
+            btn.disabled = true;
+        }
+
+        function connectWs(eventId) {
+            if (ws) ws.close();
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            const wsUrl = `${proto}://${location.host}/ws/events/${eventId}`;
+            ws = new WebSocket(wsUrl);
+            ws.onopen = () => { retry = 0; };
+            ws.onmessage = evt => {
+                const data = JSON.parse(evt.data);
+                if (data.type === 'seats_updated') {
+                    data.seat_ids.forEach(id => updateSeatButton(id));
+                }
+            };
+            ws.onclose = ws.onerror = () => {
+                if (pingInterval) clearInterval(pingInterval);
+                const delays = [500, 1000, 2000, 5000, 10000];
+                const timeout = delays[Math.min(retry, delays.length - 1)];
+                retry++;
+                setTimeout(() => connectWs(eventId), timeout);
+            };
+            pingInterval = setInterval(() => {
+                if (ws && ws.readyState === WebSocket.OPEN) ws.send('ping');
+            }, 25000);
+        }
+
         async function loadSeats(id) {
+            currentEventId = id;
             const res = await fetch(`/api/events/${id}/seats`);
             const seats = await res.json();
             const container = document.getElementById('events');
-            container.innerHTML = '<h2>Asientos</h2>';
+            container.innerHTML = '<h2>Asientos</h2><div id="seats"></div><button id="buy" disabled>Comprar</button>';
+            const seatsDiv = document.getElementById('seats');
             seats.forEach(s => {
                 const btn = document.createElement('button');
                 btn.dataset.id = s.id;
-                btn.textContent = `${s.number}${s.sold ? ' (vendido)' : ''}`;
+                btn.textContent = s.number + (s.sold ? ' (vendido)' : '');
+                btn.className = s.sold ? 'sold' : 'free';
                 btn.disabled = s.sold;
-                btn.onclick = () => purchase(id, s.id);
-                container.appendChild(btn);
+                btn.onclick = () => toggleSeat(btn);
+                seatsDiv.appendChild(btn);
             });
-            if (ws) ws.close();
-            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-            ws = new WebSocket(`${proto}://${location.host}/ws/${id}`);
-            ws.onmessage = evt => {
-                const data = JSON.parse(evt.data);
-                const btn = [...container.querySelectorAll('button')].find(b => b.dataset.id == data.seat_id);
-                if (btn) {
-                    btn.textContent = `${btn.textContent.split(' ')[0]} (vendido)`;
-                    btn.disabled = true;
-                }
-            };
+            document.getElementById('buy').onclick = purchase;
+            connectWs(id);
         }
-        async function purchase(eventId, seatId) {
+
+        async function purchase() {
+            const status = document.getElementById('status');
+            const buy = document.getElementById('buy');
+            const seatIds = [...document.querySelectorAll('#seats button.sel')].map(b => parseInt(b.dataset.id));
+            if (!seatIds.length) return;
+            buy.disabled = true;
+            status.textContent = 'Procesando...';
             const token = localStorage.getItem('token');
-            const res = await fetch(`/api/events/${eventId}/seats/${seatId}/purchase`, {
-                method:'POST',
-                headers: token ? {'Authorization': 'Bearer '+token} : {}
-            });
-            if (res.status === 409) {
-                alert('Asiento ya vendido');
-            } else {
-                const data = await res.json();
-                alert('Orden #' + data.order_id);
+            const body = JSON.stringify({ event_id: currentEventId, seat_ids: seatIds });
+            const headers = { 'Content-Type': 'application/json' };
+            if (token) headers['Authorization'] = 'Bearer ' + token;
+
+            async function postOrder() {
+                return fetch('/api/orders', { method: 'POST', headers, body });
             }
+
+            let res = await postOrder();
+            if (res.status === 502 || res.status === 503) {
+                await new Promise(r => setTimeout(r, 1000));
+                res = await postOrder();
+            }
+
+            if (res.status === 401) {
+                status.textContent = 'Requiere login';
+                document.getElementById('login').style.display = 'block';
+            } else if (res.status === 409) {
+                status.textContent = 'Asiento ya vendido';
+                await loadSeats(currentEventId);
+            } else if (res.ok) {
+                const data = await res.json();
+                status.textContent = 'Orden #' + data.order_id;
+                document.querySelectorAll('#seats button.sel').forEach(b => b.className = 'free');
+                updateBuyButton();
+                const qr = document.getElementById('qr');
+                qr.src = `/tickets/${data.order_id}/qrcode.png?t=${Date.now()}`;
+                qr.style.display = 'block';
+            } else {
+                status.textContent = 'Error en la compra';
+            }
+            buy.disabled = false;
         }
-        // Cargar eventos al iniciar
+
         loadEvents();
     </script>
 </body>

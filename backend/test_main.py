@@ -22,9 +22,12 @@ def test_login_and_purchase():
     assert response.status_code == 200
     data = response.json()
     assert "access_token" in data
-    # Purchase a seat
-    purchase = client.post("/api/events/1/seats/1/purchase")
-    # puede devolver 409 si otro test ya lo vendió
+    # Purchase a seat via /api/orders
+    purchase = client.post(
+        "/api/orders",
+        json={"event_id": 1, "seat_ids": [1]},
+        headers={"Authorization": f"Bearer {data['access_token']}"},
+    )
     assert purchase.status_code in (200, 409)
     if purchase.status_code == 200:
         order_id = purchase.json()["order_id"]
